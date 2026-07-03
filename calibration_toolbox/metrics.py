@@ -8,7 +8,7 @@ Error (GCE) framework.
 
 import numpy as np
 from scipy.special import softmax
-from typing import Union, Literal
+from typing import Union, Literal, Tuple
 
 
 def general_calibration_error(
@@ -20,8 +20,9 @@ def general_calibration_error(
     top_k_classes: Union[int, Literal['all']] = 1,
     norm: Union[int, Literal['inf']] = 1,
     thresholding: float = 0.0,
-    logits: bool = False
-) -> float:
+    logits: bool = False,
+    direction: bool = False
+) -> Union[float, Tuple[float, float]]:
     """
     Calculate General Calibration Error (GCE).
     
@@ -34,6 +35,10 @@ def general_calibration_error(
     Where acc(b,k) and conf(b,k) are the accuracy and confidence of bin b for
     class label k; n_bk is the number of predictions in bin b for class k;
     N is the total number of data points; and K is the number of classes.
+    
+    When direction=True, overconfident and underconfident bins are aggregated
+    separately (not netted). Returns (over, under), the weighted L1 means of
+    max(conf - acc, 0) and max(acc - conf, 0) respectively.
     
     References:
         Kull et al. (2019). "Beyond temperature scaling: Obtaining well-calibrated
@@ -57,9 +62,14 @@ def general_calibration_error(
         thresholding: Ignore probabilities below this threshold. Default: 0.0.
         logits: If True, input is logits and will be converted to probabilities.
             Default: False.
+        direction: If True, return separate over- and under-confidence L1
+            means as (over, under). Default: False.
     
     Returns:
-        float: GCE value, typically between 0 and 1 (lower is better).
+        float: GCE value when direction=False (non-negative).
+        tuple[float, float]: (over, under) when direction=True, both
+            non-negative. over + under equals the non-directional L1 error
+            for the same configuration.
     
     Example:
         >>> probs = np.array([[0.8, 0.2], [0.6, 0.4], [0.7, 0.3]])
@@ -99,47 +109,49 @@ def general_calibration_error(
     
     if not class_conditional:
         # Standard calibration (top-1 prediction only)
-        gce = _compute_calibration_error(
-            confidences, accuracies, n_bins, adaptive_bins, norm
+        return _compute_calibration_error(
+            confidences, accuracies, n_bins, adaptive_bins, norm, direction
         )
+
+    # Class-conditional calibration
+    class_errors = []
+    if top_k_classes == 'all':
+        for k in range(n_classes):
+            class_probs = probabilities[:, k]
+            class_correct = (labels == k).astype(float)
+
+            if np.sum(class_probs > 0) == 0:  # Skip if no predictions for this class
+                continue
+
+            error = _compute_calibration_error(
+                class_probs, class_correct, n_bins, adaptive_bins, norm,
+                direction
+            )
+            class_errors.append(error)
     else:
-        # Class-conditional calibration
-        if top_k_classes == 'all':
-            # Compute for all classes
-            class_errors = []
-            for k in range(n_classes):
-                class_probs = probabilities[:, k]
-                class_correct = (labels == k).astype(float)
-                
-                if np.sum(class_probs > 0) == 0:  # Skip if no predictions for this class
-                    continue
-                
-                error = _compute_calibration_error(
-                    class_probs, class_correct, n_bins, adaptive_bins, norm
-                )
-                class_errors.append(error)
-            
-            gce = np.mean(class_errors) if class_errors else 0.0
-        else:
-            # Compute for top-k classes
-            top_k = min(top_k_classes, n_classes)
-            top_k_indices = np.argsort(probabilities, axis=1)[:, -top_k:]
-            
-            class_errors = []
-            for k in range(top_k):
-                # Get k-th highest probability for each sample
-                k_idx = top_k_indices[:, -(k+1)]
-                k_probs = probabilities[np.arange(n_samples), k_idx]
-                k_correct = (labels == k_idx).astype(float)
-                
-                error = _compute_calibration_error(
-                    k_probs, k_correct, n_bins, adaptive_bins, norm
-                )
-                class_errors.append(error)
-            
-            gce = np.mean(class_errors) if class_errors else 0.0
-    
-    return float(gce)
+        # Compute for top-k classes
+        top_k = min(top_k_classes, n_classes)
+        top_k_indices = np.argsort(probabilities, axis=1)[:, -top_k:]
+
+        for k in range(top_k):
+            # Get k-th highest probability for each sample
+            k_idx = top_k_indices[:, -(k+1)]
+            k_probs = probabilities[np.arange(n_samples), k_idx]
+            k_correct = (labels == k_idx).astype(float)
+
+            error = _compute_calibration_error(
+                k_probs, k_correct, n_bins, adaptive_bins, norm, direction
+            )
+            class_errors.append(error)
+
+    if not class_errors:
+        return (0.0, 0.0) if direction else 0.0
+
+    if direction:
+        overs, unders = zip(*class_errors)
+        return float(np.mean(overs)), float(np.mean(unders))
+
+    return float(np.mean(class_errors))
 
 
 def _compute_calibration_error(
@@ -147,8 +159,9 @@ def _compute_calibration_error(
     accuracies: np.ndarray,
     n_bins: int,
     adaptive_bins: bool,
-    norm: Union[int, Literal['inf']]
-) -> float:
+    norm: Union[int, Literal['inf']],
+    direction: bool = False
+) -> Union[float, Tuple[float, float]]:
     """
     Compute calibration error for a single set of confidences and accuracies.
     
@@ -158,14 +171,18 @@ def _compute_calibration_error(
         n_bins: Number of bins.
         adaptive_bins: Whether to use adaptive binning.
         norm: L^p norm to use.
+        direction: If True, return separate over- and under-confidence L1
+            means as (over, under) instead of a single absolute error.
+            Default: False.
     
     Returns:
-        float: Calibration error value.
+        float: Calibration error when direction=False.
+        tuple[float, float]: (over, under) when direction=True.
     """
     n_samples = len(confidences)
     
     if n_samples == 0:
-        return 0.0
+        return (0.0, 0.0) if direction else 0.0
     
     # Compute bin boundaries
     if adaptive_bins:
@@ -190,6 +207,8 @@ def _compute_calibration_error(
     # Compute calibration error for each bin
     bin_errors = []
     bin_weights = []
+    over = 0.0
+    under = 0.0
     
     for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
         # Find samples in this bin
@@ -203,11 +222,21 @@ def _compute_calibration_error(
         if bin_size > 0:
             bin_confidence = np.mean(confidences[in_bin])
             bin_accuracy = np.mean(accuracies[in_bin])
-            bin_error = np.abs(bin_confidence - bin_accuracy)
-            
-            bin_errors.append(bin_error)
-            bin_weights.append(bin_size / n_samples)
+            gap = bin_confidence - bin_accuracy
+            weight = bin_size / n_samples
+
+            if direction:
+                if gap > 0:
+                    over += weight * gap
+                elif gap < 0:
+                    under += weight * (-gap)
+            else:
+                bin_errors.append(np.abs(gap))
+                bin_weights.append(weight)
     
+    if direction:
+        return float(over), float(under)
+
     if not bin_errors:
         return 0.0
     
@@ -386,13 +415,19 @@ def adaptive_calibration_error(
     probabilities: np.ndarray,
     labels: np.ndarray,
     n_bins: int = 15,
-    logits: bool = False
-) -> float:
+    logits: bool = False,
+    direction: bool = False
+) -> Union[float, Tuple[float, float]]:
     """
     Calculate Adaptive Calibration Error (ACE).
     
-    ACE is the class-conditional calibration error with adaptive binning
-    (equal number of samples per bin), averaged across all classes.
+    By default, ACE is the class-conditional calibration error with adaptive
+    binning (equal number of samples per bin), averaged across all classes.
+    
+    When direction=True, uses top-1 predictions only (not class-conditional)
+    and returns (over, under): the weighted L1 means of max(conf - acc, 0)
+    and max(acc - conf, 0) across bins. These are not netted; over + under
+    equals top-1 adaptive absolute L1 error.
     
     Reference:
         Nixon et al. (2020). "Measuring Calibration in Deep Learning."
@@ -405,18 +440,23 @@ def adaptive_calibration_error(
         n_bins: Number of bins for confidence discretization. Default: 15.
         logits: If True, input is logits and will be converted to probabilities.
             Default: False.
+        direction: If True, return top-1 (over, under) L1 means. Default: False.
     
     Returns:
-        float: ACE value (lower is better).
+        float: Class-conditional ACE when direction=False.
+        tuple[float, float]: (over, under) when direction=True, both
+            non-negative.
     
     Example:
         >>> probs = np.array([[0.8, 0.2], [0.6, 0.4], [0.7, 0.3]])
         >>> labels = np.array([0, 1, 0])
         >>> ace = adaptive_calibration_error(probs, labels)
+        >>> over, under = adaptive_calibration_error(probs, labels, direction=True)
     """
     return general_calibration_error(
-        probabilities, labels, n_bins=n_bins, class_conditional=True,
-        adaptive_bins=True, top_k_classes='all', norm=1, logits=logits
+        probabilities, labels, n_bins=n_bins,
+        class_conditional=not direction, adaptive_bins=True,
+        top_k_classes='all', norm=1, logits=logits, direction=direction
     )
 
 

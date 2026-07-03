@@ -170,6 +170,183 @@ class TestAdaptiveCalibrationError:
         # Both should be valid values
         assert ace >= 0 and sce >= 0
 
+    def test_direction_false_matches_default(self):
+        """direction=False must match the default non-directional ACE."""
+        np.random.seed(42)
+        probs = np.random.dirichlet(np.ones(3), size=100)
+        labels = np.random.randint(0, 3, size=100)
+
+        ace_default = metrics.adaptive_calibration_error(probs, labels)
+        ace_explicit = metrics.adaptive_calibration_error(
+            probs, labels, direction=False
+        )
+        assert ace_default == ace_explicit
+        assert ace_default >= 0
+
+    def test_direction_false_non_negative(self):
+        """Non-directional ACE remains non-negative."""
+        np.random.seed(0)
+        probs = np.random.dirichlet(np.ones(2), size=50)
+        labels = np.random.randint(0, 2, size=50)
+        ace = metrics.adaptive_calibration_error(probs, labels, direction=False)
+        assert ace >= 0
+
+
+class TestDirectionalCalibrationError:
+    """Tests for directional (over, under) calibration error."""
+
+    def test_hand_computed_overconfident(self):
+        """Single-bin overconfident case: conf=0.9, all wrong -> (0.9, 0)."""
+        confidences = np.array([0.9, 0.9, 0.9])
+        accuracies = np.array([0.0, 0.0, 0.0])
+        over, under = metrics._compute_calibration_error(
+            confidences, accuracies, n_bins=1, adaptive_bins=True,
+            norm=1, direction=True
+        )
+        assert over == pytest.approx(0.9)
+        assert under == pytest.approx(0.0)
+
+    def test_hand_computed_underconfident(self):
+        """Single-bin underconfident case: conf=0.6, all correct -> (0, 0.4)."""
+        confidences = np.array([0.6, 0.6, 0.6])
+        accuracies = np.array([1.0, 1.0, 1.0])
+        over, under = metrics._compute_calibration_error(
+            confidences, accuracies, n_bins=1, adaptive_bins=True,
+            norm=1, direction=True
+        )
+        assert over == pytest.approx(0.0)
+        assert under == pytest.approx(0.4)
+
+    def test_hand_computed_perfect(self):
+        """Single-bin perfect calibration: conf matches accuracy -> (0, 0)."""
+        confidences = np.array([0.5, 0.5, 0.5, 0.5])
+        accuracies = np.array([1.0, 0.0, 1.0, 0.0])  # mean acc = 0.5
+        over, under = metrics._compute_calibration_error(
+            confidences, accuracies, n_bins=1, adaptive_bins=True,
+            norm=1, direction=True
+        )
+        assert over == pytest.approx(0.0)
+        assert under == pytest.approx(0.0)
+
+    def test_hand_computed_via_gce(self):
+        """Directional GCE (top-1, adaptive, L1) matches hand-computed gaps."""
+        # Overconfident: all predict class 0 with conf 0.9, all wrong
+        probs_over = np.array([[0.9, 0.1], [0.9, 0.1], [0.9, 0.1]])
+        labels_over = np.array([1, 1, 1])
+        over, under = metrics.general_calibration_error(
+            probs_over, labels_over, n_bins=1, class_conditional=False,
+            adaptive_bins=True, norm=1, direction=True
+        )
+        assert over == pytest.approx(0.9)
+        assert under == pytest.approx(0.0)
+
+        # Underconfident: all predict class 0 with conf 0.6, all correct
+        probs_under = np.array([[0.6, 0.4], [0.6, 0.4], [0.6, 0.4]])
+        labels_under = np.array([0, 0, 0])
+        over, under = metrics.general_calibration_error(
+            probs_under, labels_under, n_bins=1, class_conditional=False,
+            adaptive_bins=True, norm=1, direction=True
+        )
+        assert over == pytest.approx(0.0)
+        assert under == pytest.approx(0.4)
+
+    def test_directional_ace_overconfident(self):
+        """Directional ACE (top-1): overconfident predictions -> (over > 0, under == 0)."""
+        probs = np.array([
+            [0.95, 0.05],
+            [0.95, 0.05],
+            [0.05, 0.95],
+            [0.05, 0.95],
+        ])
+        labels = np.array([1, 1, 0, 0])
+        over, under = metrics.adaptive_calibration_error(
+            probs, labels, n_bins=1, direction=True
+        )
+        assert over == pytest.approx(0.95)
+        assert under == pytest.approx(0.0)
+
+    def test_directional_ace_underconfident(self):
+        """Directional ACE (top-1): underconfident predictions -> (over == 0, under > 0)."""
+        probs = np.array([
+            [0.55, 0.45],
+            [0.55, 0.45],
+            [0.45, 0.55],
+            [0.45, 0.55],
+        ])
+        labels = np.array([0, 0, 1, 1])
+        over, under = metrics.adaptive_calibration_error(
+            probs, labels, n_bins=1, direction=True
+        )
+        assert over == pytest.approx(0.0)
+        assert under == pytest.approx(0.45)
+
+    def test_directional_ace_perfect(self):
+        """Directional ACE is (0, 0) for perfectly calibrated predictions."""
+        probs = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]])
+        labels = np.array([0, 1, 0, 1])
+        over, under = metrics.adaptive_calibration_error(
+            probs, labels, n_bins=1, direction=True
+        )
+        assert over == pytest.approx(0.0, abs=1e-9)
+        assert under == pytest.approx(0.0, abs=1e-9)
+
+    def test_directional_ace_is_top1(self):
+        """Directional ACE matches top-1 adaptive GCE, not class-conditional."""
+        np.random.seed(42)
+        probs = np.random.dirichlet(np.ones(3), size=50)
+        labels = np.random.randint(0, 3, size=50)
+
+        ace_dir = metrics.adaptive_calibration_error(probs, labels, direction=True)
+        gce_top1 = metrics.general_calibration_error(
+            probs, labels, class_conditional=False, adaptive_bins=True,
+            norm=1, direction=True
+        )
+        assert ace_dir[0] == pytest.approx(gce_top1[0])
+        assert ace_dir[1] == pytest.approx(gce_top1[1])
+
+    def test_over_plus_under_equals_top1_absolute(self):
+        """over + under equals top-1 adaptive absolute L1 (not class-conditional ACE)."""
+        np.random.seed(42)
+        probs = np.random.dirichlet(np.ones(3), size=100)
+        labels = np.random.randint(0, 3, size=100)
+
+        over, under = metrics.adaptive_calibration_error(probs, labels, direction=True)
+        top1_abs = metrics.general_calibration_error(
+            probs, labels, class_conditional=False, adaptive_bins=True, norm=1
+        )
+        assert over >= 0 and under >= 0
+        assert over + under == pytest.approx(top1_abs)
+
+    def test_mixed_sign_bins_kept_separate(self):
+        """Mixed over/under bins are not netted; both components are returned."""
+        # Uniform bins: (0, 0.5] underconfident (0.4), (0.5, 1] overconfident (0.4)
+        confidences = np.array([0.9, 0.9, 0.3, 0.3])
+        accuracies = np.array([0.5, 0.5, 0.7, 0.7])
+        over, under = metrics._compute_calibration_error(
+            confidences, accuracies, n_bins=2, adaptive_bins=False,
+            norm=1, direction=True
+        )
+        absolute = metrics._compute_calibration_error(
+            confidences, accuracies, n_bins=2, adaptive_bins=False,
+            norm=1, direction=False
+        )
+        assert over == pytest.approx(0.2)
+        assert under == pytest.approx(0.2)
+        assert over + under == pytest.approx(absolute)
+
+    def test_ace_alias_with_direction(self):
+        """ACE alias matches adaptive_calibration_error with direction=True."""
+        np.random.seed(7)
+        probs = np.random.dirichlet(np.ones(2), size=40)
+        labels = np.random.randint(0, 2, size=40)
+
+        via_fn = metrics.adaptive_calibration_error(probs, labels, direction=True)
+        via_alias = metrics.ACE(probs, labels, direction=True)
+        assert via_alias == via_fn
+        assert isinstance(via_alias, tuple)
+        assert len(via_alias) == 2
+        assert all(isinstance(v, float) for v in via_alias)
+
 
 class TestTopKCalibrationError:
     """Tests for Top-K Calibration Error."""
